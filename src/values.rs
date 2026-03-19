@@ -18,6 +18,10 @@ pub enum GraphValue {
     Int(i64),
     Float(f64),
     String(String),
+    Timestamp(chrono::DateTime<chrono::FixedOffset>),
+    Date(String),
+    Base64(String),
+    Duration(String),
     List(Vec<GraphValue>),
     Map(HashMap<String, GraphValue>),
     Tagged(TaggedValue),
@@ -49,6 +53,51 @@ pub enum TaggedValue {
     },
 }
 
+/// Convert a time::Duration to an ISO 8601 duration string (e.g. "P14DT16H12M").
+fn time_duration_to_iso8601(d: &time::Duration) -> String {
+    let total_secs = d.whole_seconds().unsigned_abs();
+    let negative = d.whole_seconds() < 0;
+
+    let days = total_secs / 86400;
+    let remainder = total_secs % 86400;
+    let hours = remainder / 3600;
+    let remainder = remainder % 3600;
+    let minutes = remainder / 60;
+    let seconds = remainder % 60;
+    let nanos = d.subsec_nanoseconds().unsigned_abs() as u64;
+
+    let mut s = if negative {
+        "-P".to_string()
+    } else {
+        "P".to_string()
+    };
+    if days > 0 {
+        s.push_str(&format!("{days}D"));
+    }
+    if hours > 0 || minutes > 0 || seconds > 0 || nanos > 0 {
+        s.push('T');
+        if hours > 0 {
+            s.push_str(&format!("{hours}H"));
+        }
+        if minutes > 0 {
+            s.push_str(&format!("{minutes}M"));
+        }
+        if seconds > 0 || nanos > 0 {
+            if nanos > 0 {
+                let frac = nanos as f64 / 1_000_000_000.0;
+                let sec_f = seconds as f64 + frac;
+                s.push_str(&format!("{sec_f}S"));
+            } else {
+                s.push_str(&format!("{seconds}S"));
+            }
+        }
+    }
+    if s == "P" || s == "-P" {
+        s.push_str("T0S");
+    }
+    s
+}
+
 /// Convert a LadybugDB Value into a GraphValue for JSON serialization.
 pub fn from_lbug_value(value: &lbug::Value) -> GraphValue {
     match value {
@@ -74,16 +123,28 @@ pub fn from_lbug_value(value: &lbug::Value) -> GraphValue {
         lbug::Value::Decimal(d) => GraphValue::String(d.to_string()),
         lbug::Value::String(s) => GraphValue::String(s.clone()),
         lbug::Value::Blob(b) => {
-            GraphValue::String(base64::engine::general_purpose::STANDARD.encode(b))
+            GraphValue::Base64(base64::engine::general_purpose::STANDARD.encode(b))
         }
         lbug::Value::UUID(u) => GraphValue::String(u.to_string()),
-        lbug::Value::Date(d) => GraphValue::String(d.to_string()),
+        lbug::Value::Date(d) => GraphValue::Date(d.to_string()),
         lbug::Value::Timestamp(t)
         | lbug::Value::TimestampTz(t)
         | lbug::Value::TimestampNs(t)
         | lbug::Value::TimestampMs(t)
-        | lbug::Value::TimestampSec(t) => GraphValue::String(t.to_string()),
-        lbug::Value::Interval(d) => GraphValue::String(format!("{d:?}")),
+        | lbug::Value::TimestampSec(t) => {
+            let offset_secs = t.offset().whole_seconds();
+            let fixed_offset =
+                chrono::FixedOffset::east_opt(offset_secs).expect("valid UTC offset");
+            #[allow(deprecated)]
+            let naive =
+                chrono::NaiveDateTime::from_timestamp_opt(t.unix_timestamp(), t.nanosecond())
+                    .expect("valid timestamp");
+            GraphValue::Timestamp(chrono::DateTime::from_naive_utc_and_offset(
+                naive,
+                fixed_offset,
+            ))
+        }
+        lbug::Value::Interval(d) => GraphValue::Duration(time_duration_to_iso8601(d)),
         lbug::Value::List(_, items) | lbug::Value::Array(_, items) => {
             GraphValue::List(items.iter().map(from_lbug_value).collect())
         }

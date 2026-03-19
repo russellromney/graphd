@@ -27,6 +27,29 @@ impl SandboxConfig {
             "var_length_extend_max_depth",
             "recursive_pattern_semantic",
             "recursive_pattern_factor",
+            // FTS (full-text search) — safe, operate on tenant's own tables.
+            "create_fts_index",
+            "query_fts_index",
+            "drop_fts_index",
+            "fts_query",
+            // Vector (HNSW index) — safe, operate on tenant's own tables.
+            "create_vector_index",
+            "query_vector_index",
+            "drop_vector_index",
+            // Algo (graph algorithms) — safe, read-only on tenant's own tables.
+            "strongly_connected_components",
+            "scc",
+            "strongly_connected_components_kosaraju",
+            "scc_ko",
+            "weakly_connected_components",
+            "wcc",
+            "page_rank",
+            "pr",
+            "k_core_decomposition",
+            "kcore",
+            "louvain",
+            "spanning_forest",
+            "sf",
         ]
         .iter()
         .map(|s| s.to_string())
@@ -293,6 +316,45 @@ mod tests {
         let sb = sandbox();
         assert!(sb.check_query_text("CALL Timeout = 5000").is_ok());
         assert!(sb.check_query_text("CALL THREADS = 2").is_ok());
+    }
+
+    // === FTS calls ===
+
+    #[test]
+    fn call_fts_allowed() {
+        let sb = sandbox();
+        assert!(sb.check_query_text("CALL CREATE_FTS_INDEX('Entity', 'idx', 'name')").is_ok());
+        assert!(sb.check_query_text("CALL QUERY_FTS_INDEX('Entity', 'idx', 'search')").is_ok());
+        assert!(sb.check_query_text("CALL DROP_FTS_INDEX('Entity', 'idx')").is_ok());
+        assert!(sb.check_query_text("CALL FTS_QUERY('idx', 'search')").is_ok());
+    }
+
+    // === Vector calls ===
+
+    #[test]
+    fn call_vector_allowed() {
+        let sb = sandbox();
+        assert!(sb.check_query_text("CALL CREATE_VECTOR_INDEX('Entity', 'idx', 'embedding')").is_ok());
+        assert!(sb.check_query_text("CALL QUERY_VECTOR_INDEX('Entity', 'idx', $vec, TOP := 10)").is_ok());
+        assert!(sb.check_query_text("CALL DROP_VECTOR_INDEX('Entity', 'idx')").is_ok());
+    }
+
+    // === Algo calls ===
+
+    #[test]
+    fn call_algo_allowed() {
+        let sb = sandbox();
+        assert!(sb.check_query_text("CALL WEAKLY_CONNECTED_COMPONENTS('Person', 'Knows')").is_ok());
+        assert!(sb.check_query_text("CALL WCC('Person', 'Knows')").is_ok());
+        assert!(sb.check_query_text("CALL PAGE_RANK('Person', 'Knows')").is_ok());
+        assert!(sb.check_query_text("CALL PR('Person', 'Knows')").is_ok());
+        assert!(sb.check_query_text("CALL STRONGLY_CONNECTED_COMPONENTS('Person', 'Knows')").is_ok());
+        assert!(sb.check_query_text("CALL SCC('Person', 'Knows')").is_ok());
+        assert!(sb.check_query_text("CALL LOUVAIN('Person', 'Knows')").is_ok());
+        assert!(sb.check_query_text("CALL K_CORE_DECOMPOSITION('Person', 'Knows')").is_ok());
+        assert!(sb.check_query_text("CALL KCORE('Person', 'Knows')").is_ok());
+        assert!(sb.check_query_text("CALL SPANNING_FOREST('Person', 'Knows')").is_ok());
+        assert!(sb.check_query_text("CALL SF('Person', 'Knows')").is_ok());
     }
 
     // === Edge cases ===

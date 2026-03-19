@@ -127,7 +127,13 @@ pub fn bolt_value_to_json(bolt: &Value) -> serde_json::Value {
             }
             serde_json::Value::Object(obj)
         }
-        _ => serde_json::Value::Null, // Bytes, DateTime, Node, Relationship, etc.
+        Value::DateTimeOffset(dt) => serde_json::Value::String(dt.to_rfc3339()),
+        Value::DateTimeZoned(dt) => serde_json::Value::String(dt.to_rfc3339()),
+        Value::LocalDateTime(dt) => serde_json::Value::String(format!("{dt}")),
+        Value::Date(d) => serde_json::Value::String(format!("{d}")),
+        Value::Time(t, _) => serde_json::Value::String(format!("{t}")),
+        Value::LocalTime(t) => serde_json::Value::String(format!("{t}")),
+        _ => serde_json::Value::Null, // Bytes, Node, Relationship, Path, etc.
     }
 }
 
@@ -159,6 +165,60 @@ pub fn json_to_bolt(v: &serde_json::Value) -> Value {
     }
 }
 
+// ─── Value conversion: Bolt -> lbug (direct, no JSON intermediary) ───
+
+/// Convert a bolt-rs Value directly to a lbug Value, preserving type info (e.g. timestamps).
+pub fn bolt_value_to_lbug(bolt: &Value) -> Result<lbug::Value, crate::error::GraphdError> {
+    use crate::error::GraphdError;
+    match bolt {
+        Value::Boolean(b) => Ok(lbug::Value::Bool(*b)),
+        Value::Integer(i) => Ok(lbug::Value::Int64(*i)),
+        Value::Float(f) => Ok(lbug::Value::Double(*f)),
+        Value::String(s) => Ok(lbug::Value::String(s.clone())),
+        Value::Null => Ok(lbug::Value::Null(lbug::LogicalType::Any)),
+        Value::List(list) => {
+            let items: Result<Vec<lbug::Value>, _> = list.iter().map(bolt_value_to_lbug).collect();
+            let items = items?;
+            let elem_type = items
+                .first()
+                .map(crate::values::lbug_value_logical_type)
+                .unwrap_or(lbug::LogicalType::Any);
+            Ok(lbug::Value::List(elem_type, items))
+        }
+        Value::DateTimeOffset(dt) => {
+            let ts = time::OffsetDateTime::from_unix_timestamp(dt.timestamp())
+                .map_err(|e| GraphdError::TypeError(format!("{e}")))?
+                .replace_nanosecond(dt.timestamp_subsec_nanos())
+                .map_err(|e| GraphdError::TypeError(format!("{e}")))?;
+            let offset = time::UtcOffset::from_whole_seconds(dt.offset().local_minus_utc())
+                .map_err(|e| GraphdError::TypeError(format!("{e}")))?;
+            Ok(lbug::Value::Timestamp(ts.to_offset(offset)))
+        }
+        Value::DateTimeZoned(dt) => {
+            let fixed = dt.fixed_offset();
+            let ts = time::OffsetDateTime::from_unix_timestamp(fixed.timestamp())
+                .map_err(|e| GraphdError::TypeError(format!("{e}")))?
+                .replace_nanosecond(fixed.timestamp_subsec_nanos())
+                .map_err(|e| GraphdError::TypeError(format!("{e}")))?;
+            Ok(lbug::Value::Timestamp(ts))
+        }
+        _ => {
+            // Fall back to JSON round-trip for other types
+            Ok(crate::values::to_lbug_value(&bolt_value_to_json(bolt))?)
+        }
+    }
+}
+
+/// Convert Bolt parameters directly to lbug params (bypasses JSON).
+pub fn bolt_params_to_lbug(
+    params: &HashMap<String, Value>,
+) -> Result<Vec<(String, lbug::Value)>, crate::error::GraphdError> {
+    params
+        .iter()
+        .map(|(k, v)| Ok((k.clone(), bolt_value_to_lbug(v)?)))
+        .collect()
+}
+
 // ─── Value conversion: GraphValue <-> Bolt ───
 
 /// Convert a GraphValue to bolt-rs Value for RECORD responses.
@@ -169,6 +229,9 @@ pub fn graph_value_to_bolt(gv: &GraphValue) -> Value {
         GraphValue::Int(i) => Value::from(*i),
         GraphValue::Float(f) => Value::from(*f),
         GraphValue::String(s) => Value::from(s.clone()),
+        GraphValue::Date(s) | GraphValue::Base64(s) | GraphValue::Duration(s) => {
+            Value::from(s.clone())
+        }
         GraphValue::List(items) => {
             Value::from(items.iter().map(graph_value_to_bolt).collect::<Vec<_>>())
         }
@@ -179,6 +242,7 @@ pub fn graph_value_to_bolt(gv: &GraphValue) -> Value {
                 .collect();
             Value::from(map)
         }
+        GraphValue::Timestamp(dt) => Value::DateTimeOffset(*dt),
         GraphValue::Tagged(_) => {
             let json = serde_json::to_value(gv).unwrap_or(serde_json::Value::Null);
             json_to_bolt(&json)
@@ -215,7 +279,12 @@ pub fn record_message(values: Vec<Value>) -> Vec<Bytes> {
 pub fn failure_message_versioned(bolt_version: BoltVersion, code: &str, message: &str) -> Vec<Bytes> {
     let mut metadata = HashMap::new();
 
+    // `message` is required in all Bolt versions.
+    metadata.insert("message".to_string(), Value::from(message));
+
     match bolt_version {
+        // Bolt 5.7+: `code` removed, replaced by `neo4j_code` + GQL status fields.
+        // Spec: https://neo4j.com/docs/bolt/current/bolt/message/
         BoltVersion::V5(minor) if minor >= 7 => {
             metadata.insert("neo4j_code".to_string(), Value::from(code));
             metadata.insert("description".to_string(), Value::from(message));
@@ -225,9 +294,9 @@ pub fn failure_message_versioned(bolt_version: BoltVersion, code: &str, message:
             diagnostic.insert("_severity".to_string(), Value::from("ERROR"));
             metadata.insert("diagnostic_record".to_string(), Value::from(diagnostic));
         }
+        // Pre-5.7: `code` + `message`.
         _ => {
             metadata.insert("code".to_string(), Value::from(code));
-            metadata.insert("message".to_string(), Value::from(message));
         }
     }
 

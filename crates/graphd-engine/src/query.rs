@@ -79,6 +79,65 @@ pub fn run_query_raw<'db>(
     }
 }
 
+/// Execute a query with pre-converted lbug params (used by Bolt path to avoid JSON intermediary).
+///
+/// The rewriter still generates JSON params for non-deterministic functions; these are
+/// converted to lbug values and merged with the caller-supplied params.
+#[cfg(feature = "bolt")]
+pub fn run_query_raw_bolt<'db>(
+    conn: &lbug::Connection<'db>,
+    query: &str,
+    bolt_params: Option<Vec<(String, lbug::Value)>>,
+) -> Result<RawExecution<'db>, GraphdError> {
+    let rewrite = crate::rewriter::rewrite_query(query);
+    let query_str = rewrite.query.clone();
+    let query = &rewrite.query;
+
+    // Merge bolt params with rewriter-generated params
+    let mut params = bolt_params.unwrap_or_default();
+    for (key, json_val) in &rewrite.generated_params {
+        params.push((key.clone(), values::to_lbug_value(json_val)?));
+    }
+
+    // For journaling, serialize params back to JSON
+    let merged_json = if params.is_empty() {
+        None
+    } else {
+        let mut map = serde_json::Map::new();
+        for (k, v) in &params {
+            map.insert(k.clone(), serde_json::Value::String(format!("{v:?}")));
+        }
+        Some(serde_json::Value::Object(map))
+    };
+
+    let result = if params.is_empty() {
+        conn.query(query)
+            .map_err(|e| GraphdError::SyntaxError(format!("{e}")))
+    } else {
+        let refs: Vec<(&str, lbug::Value)> =
+            params.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+        match conn.prepare(query) {
+            Ok(mut prepared) => conn
+                .execute(&mut prepared, refs)
+                .map_err(|e| GraphdError::SyntaxError(format!("{e}"))),
+            Err(e) => Err(GraphdError::SyntaxError(format!("{e}"))),
+        }
+    };
+
+    match result {
+        Ok(qr) => {
+            let columns = qr.get_column_names();
+            Ok(RawExecution {
+                query_result: qr,
+                columns,
+                rewritten_query: query_str,
+                merged_params: merged_json,
+            })
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Take up to `limit` rows from a QueryResult. Returns (rows, has_more).
 /// Uses `buf` to buffer a peeked row across calls — pass `&mut None` for one-shot reads.
 pub(crate) fn take_rows(

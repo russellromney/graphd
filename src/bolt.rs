@@ -1,4 +1,6 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufStream};
@@ -26,6 +28,11 @@ pub use graphd_engine::bolt::{
     negotiate_bolt_version_with_limit, BoltVersion,
 };
 
+/// Monotonic connection ID counter (unique per server process).
+static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
+/// Monotonic bookmark counter — incremented on every committed write.
+static NEXT_BOOKMARK: AtomicU64 = AtomicU64::new(1);
+
 /// Shared state for the Bolt listener.
 #[derive(Clone)]
 pub struct BoltState {
@@ -35,6 +42,7 @@ pub struct BoltState {
     pub replica: bool,
     pub metrics: Arc<Metrics>,
     pub rate_limiter: Arc<RateLimiter>,
+    pub bolt_addr: String,
 }
 
 /// Start the Bolt TCP listener.
@@ -139,6 +147,7 @@ async fn handle_connection(socket: TcpStream, state: BoltState, peer_ip: std::ne
     let engine = state.engine.clone();
     let tokens = state.tokens.clone();
     let replica = state.replica;
+    let bolt_addr = state.bolt_addr.clone();
 
     // Channel for sending requests from the async reader to the blocking worker.
     let (req_tx, req_rx) = tokio::sync::mpsc::unbounded_channel::<BoltOp>();
@@ -149,7 +158,7 @@ async fn handle_connection(socket: TcpStream, state: BoltState, peer_ip: std::ne
 
     // Blocking session worker.
     let worker_handle = tokio::task::spawn_blocking(move || {
-        bolt_session_worker(bolt_version, engine, tokens, replica, metrics, rate_limiter, peer_ip, req_rx, resp_tx);
+        bolt_session_worker(bolt_version, engine, tokens, replica, metrics, rate_limiter, peer_ip, bolt_addr, req_rx, resp_tx);
     });
 
     // ── Message loop ──
@@ -216,6 +225,7 @@ fn bolt_session_worker(
     metrics: Arc<Metrics>,
     rate_limiter: Arc<RateLimiter>,
     peer_ip: std::net::IpAddr,
+    bolt_addr: String,
     rx: tokio::sync::mpsc::UnboundedReceiver<BoltOp>,
     tx: tokio::sync::mpsc::UnboundedSender<Vec<Bytes>>,
 ) {
@@ -233,6 +243,10 @@ fn bolt_session_worker(
     let mut authenticated = false;
     let mut in_transaction = false;
     let mut tx_journal_buf: Vec<PendingEntry> = Vec::new();
+    let connection_id = format!("bolt-{}", NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed));
+    let mut last_query_is_mutation = false;
+    let mut qid_counter: i64 = 0;
+    let mut query_start: Option<Instant> = None;
 
     // Write guard for serializing mutations across all paths.
     // Held for single auto-commit writes, or from BEGIN to COMMIT/ROLLBACK.
@@ -273,12 +287,17 @@ fn bolt_session_worker(
             &metrics,
             &rate_limiter,
             peer_ip,
+            &bolt_addr,
+            &connection_id,
             &mut authenticated,
             &mut in_transaction,
             &mut tx_journal_buf,
             &mut current_result,
             &mut result_columns,
             &mut result_consumed,
+            &mut last_query_is_mutation,
+            &mut qid_counter,
+            &mut query_start,
         );
 
         // Release write guard when not in a transaction.
@@ -339,12 +358,17 @@ fn handle_bolt_message<'db>(
     metrics: &Arc<Metrics>,
     rate_limiter: &Arc<RateLimiter>,
     peer_ip: std::net::IpAddr,
+    bolt_addr: &str,
+    connection_id: &str,
     authenticated: &mut bool,
     in_transaction: &mut bool,
     tx_journal_buf: &mut Vec<PendingEntry>,
     current_result: &mut Option<lbug::QueryResult<'db>>,
     result_columns: &mut Vec<String>,
     result_consumed: &mut bool,
+    last_query_is_mutation: &mut bool,
+    qid_counter: &mut i64,
+    query_start: &mut Option<Instant>,
 ) -> Vec<Bytes> {
     match req {
         // ── HELLO ──
@@ -398,9 +422,9 @@ fn handle_bolt_message<'db>(
             let mut metadata = HashMap::new();
             metadata.insert(
                 "server".to_string(),
-                Value::from(format!("Neo4j/5.x.0-graphd-{}", env!("CARGO_PKG_VERSION"))),
+                Value::from("Neo4j/5.26.0"),
             );
-            metadata.insert("connection_id".to_string(), Value::from("bolt-1"));
+            metadata.insert("connection_id".to_string(), Value::from(connection_id));
 
             // Add connection hints based on Bolt version
             add_connection_hints(bolt_version, &mut metadata);
@@ -422,7 +446,9 @@ fn handle_bolt_message<'db>(
             }
 
             let query_str = run.query();
-            let query_type = if journal::is_mutation(query_str) { "write" } else { "read" };
+            *last_query_is_mutation = journal::is_mutation(query_str);
+            *query_start = Some(Instant::now());
+            let query_type = if *last_query_is_mutation { "write" } else { "read" };
 
             // Reject mutations in replica mode.
             if replica && query_type == "write" {
@@ -471,6 +497,13 @@ fn handle_bolt_message<'db>(
 
                     let mut metadata = HashMap::new();
                     metadata.insert("fields".to_string(), Value::from(cols));
+                    if let Some(start) = query_start {
+                        metadata.insert("t_first".to_string(), Value::Integer(start.elapsed().as_millis() as i64));
+                    }
+                    if *in_transaction {
+                        *qid_counter += 1;
+                        metadata.insert("qid".to_string(), Value::Integer(*qid_counter - 1));
+                    }
                     success_message(metadata)
                 }
                 Err(e) => {
@@ -494,7 +527,9 @@ fn handle_bolt_message<'db>(
             }
 
             let query_str = run.statement();
-            let query_type = if journal::is_mutation(query_str) { "write" } else { "read" };
+            *last_query_is_mutation = journal::is_mutation(query_str);
+            *query_start = Some(Instant::now());
+            let query_type = if *last_query_is_mutation { "write" } else { "read" };
 
             // Reject mutations in replica mode.
             if replica && query_type == "write" {
@@ -542,6 +577,13 @@ fn handle_bolt_message<'db>(
 
                     let mut metadata = HashMap::new();
                     metadata.insert("fields".to_string(), Value::from(cols));
+                    if let Some(start) = query_start {
+                        metadata.insert("t_first".to_string(), Value::Integer(start.elapsed().as_millis() as i64));
+                    }
+                    if *in_transaction {
+                        *qid_counter += 1;
+                        metadata.insert("qid".to_string(), Value::Integer(*qid_counter - 1));
+                    }
                     success_message(metadata)
                 }
                 Err(e) => {
@@ -558,12 +600,15 @@ fn handle_bolt_message<'db>(
         // ── PULL ──
         Message::Pull(pull) => {
             if current_result.is_none() || *result_consumed {
-                return success_message(HashMap::new());
+                let mut metadata = HashMap::new();
+                metadata.insert("has_more".to_string(), Value::from(false));
+                return success_message(metadata);
             }
 
             let max_records = pull.metadata()
                 .get("n")
                 .and_then(|v| match v {
+                    Value::Integer(i) if *i < 0 => Some(usize::MAX), // -1 means "fetch all"
                     Value::Integer(i) => Some(*i as usize),
                     _ => None,
                 })
@@ -597,6 +642,21 @@ fn handle_bolt_message<'db>(
             let has_more = !*result_consumed;
             let mut metadata = HashMap::new();
             metadata.insert("has_more".to_string(), Value::from(has_more));
+
+            // Final PULL: include type, timing, and bookmark metadata.
+            if !has_more {
+                let qtype = if *last_query_is_mutation { "rw" } else { "r" };
+                metadata.insert("type".to_string(), Value::from(qtype));
+                if let Some(start) = query_start {
+                    metadata.insert("t_last".to_string(), Value::Integer(start.elapsed().as_millis() as i64));
+                }
+                // Auto-commit writes get a bookmark.
+                if !*in_transaction && *last_query_is_mutation {
+                    let bk = NEXT_BOOKMARK.fetch_add(1, Ordering::Relaxed);
+                    metadata.insert("bookmark".to_string(), Value::from(format!("graphd:bookmark:v1:tx{bk}")));
+                }
+            }
+
             let success_chunks = success_message(metadata);
             responses.extend(success_chunks);
             responses
@@ -661,6 +721,7 @@ fn handle_bolt_message<'db>(
             match conn.query("COMMIT") {
                 Ok(_) => {
                     *in_transaction = false;
+                    *qid_counter = 0;
                     for entry in tx_journal_buf.drain(..) {
                         if let Some(ref jtx) = journal {
                             if jtx.send(JournalCommand::Write(entry)).is_err() {
@@ -668,7 +729,10 @@ fn handle_bolt_message<'db>(
                             }
                         }
                     }
-                    success_message(HashMap::new())
+                    let bk = NEXT_BOOKMARK.fetch_add(1, Ordering::Relaxed);
+                    let mut metadata = HashMap::new();
+                    metadata.insert("bookmark".to_string(), Value::from(format!("graphd:bookmark:v1:tx{bk}")));
+                    success_message(metadata)
                 }
                 Err(e) => failure_message_versioned(bolt_version,
                     "Neo.DatabaseError.General.UnknownError",
@@ -689,6 +753,7 @@ fn handle_bolt_message<'db>(
             match conn.query("ROLLBACK") {
                 Ok(_) => {
                     *in_transaction = false;
+                    *qid_counter = 0;
                     tx_journal_buf.clear();
                     success_message(HashMap::new())
                 }
@@ -708,6 +773,7 @@ fn handle_bolt_message<'db>(
             }
             *current_result = None;
             *result_consumed = true;
+            *qid_counter = 0;
             success_message(HashMap::new())
         }
 
@@ -769,9 +835,9 @@ fn handle_bolt_message<'db>(
             let mut metadata = HashMap::new();
             metadata.insert(
                 "server".to_string(),
-                Value::from(format!("Neo4j/5.x.0-graphd-{}", env!("CARGO_PKG_VERSION"))),
+                Value::from("Neo4j/5.26.0"),
             );
-            metadata.insert("connection_id".to_string(), Value::from("bolt-1"));
+            metadata.insert("connection_id".to_string(), Value::from(connection_id));
 
             // Add connection hints based on Bolt version
             add_connection_hints(bolt_version, &mut metadata);
@@ -791,6 +857,39 @@ fn handle_bolt_message<'db>(
             debug!("Received TELEMETRY: api={}", telemetry.api());
             // Accept and acknowledge telemetry data
             success_message(HashMap::new())
+        }
+
+        // ── ROUTE / ROUTE_WITH_METADATA ──
+        // Return a single-server routing table (all roles point to this server).
+        Message::Route(_) | Message::RouteWithMetadata(_) => {
+            let addr = if bolt_addr.starts_with("0.0.0.0") {
+                bolt_addr.replacen("0.0.0.0", "localhost", 1)
+            } else {
+                bolt_addr.to_string()
+            };
+            let server_entry = |role: &str| -> Value {
+                let mut entry = HashMap::new();
+                entry.insert("role".to_string(), Value::from(role));
+                entry.insert(
+                    "addresses".to_string(),
+                    Value::from(vec![Value::from(addr.clone())]),
+                );
+                Value::from(entry)
+            };
+            let mut rt = HashMap::new();
+            rt.insert("ttl".to_string(), Value::Integer(300));
+            rt.insert("db".to_string(), Value::from("neo4j"));
+            rt.insert(
+                "servers".to_string(),
+                Value::from(vec![
+                    server_entry("WRITE"),
+                    server_entry("READ"),
+                    server_entry("ROUTE"),
+                ]),
+            );
+            let mut metadata = HashMap::new();
+            metadata.insert("rt".to_string(), Value::from(rt));
+            success_message(metadata)
         }
 
         // Catch-all for unsupported messages
@@ -821,6 +920,9 @@ fn graph_value_to_bolt(gv: &GraphValue) -> Value {
         GraphValue::Int(i) => Value::from(*i),
         GraphValue::Float(f) => Value::from(*f),
         GraphValue::String(s) => Value::from(s.clone()),
+        GraphValue::Date(s) | GraphValue::Base64(s) | GraphValue::Duration(s) => {
+            Value::from(s.clone())
+        }
         GraphValue::List(items) => {
             Value::from(items.iter().map(graph_value_to_bolt).collect::<Vec<_>>())
         }
@@ -831,6 +933,7 @@ fn graph_value_to_bolt(gv: &GraphValue) -> Value {
                 .collect();
             Value::from(map)
         }
+        GraphValue::Timestamp(dt) => Value::DateTimeOffset(*dt),
         GraphValue::Tagged(_tagged) => {
             // Serialize tagged values (Node, Rel, Path) as maps with $type.
             let json = serde_json::to_value(gv).unwrap_or(serde_json::Value::Null);

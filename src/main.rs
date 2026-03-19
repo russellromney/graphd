@@ -264,6 +264,7 @@ async fn main() {
         replica: config.replica,
         metrics: metrics.clone(),
         rate_limiter: rate_limiter.clone(),
+        bolt_addr: format!("{}:{}", config.bolt_host, config.bolt_port),
     };
 
     // ── Shutdown signal ──
