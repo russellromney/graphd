@@ -504,6 +504,78 @@ fn parse_iso8601_duration(s: &str) -> Result<time::Duration, GraphdError> {
 
 /// Serialize a GraphValue to Neo4j Query API v2 typed JSON format.
 ///
+/// Convert a GraphValue to plain JSON (no type wrappers).
+/// Scalars become native JSON types: Int->Number, String->String, Bool->Bool.
+/// Nodes/Rels/Paths keep structure but with plain property values.
+pub fn graph_value_to_plain_json(gv: &GraphValue) -> serde_json::Value {
+    match gv {
+        GraphValue::Null => serde_json::Value::Null,
+        GraphValue::Bool(b) => serde_json::json!(b),
+        GraphValue::Int(i) => serde_json::json!(i),
+        GraphValue::Float(f) => serde_json::json!(f),
+        GraphValue::String(s) => serde_json::json!(s),
+        GraphValue::Timestamp(dt) => serde_json::json!(dt.to_rfc3339()),
+        GraphValue::Date(s) => serde_json::json!(s),
+        GraphValue::Base64(s) => serde_json::json!(s),
+        GraphValue::Duration(s) => serde_json::json!(s),
+        GraphValue::List(items) => {
+            serde_json::Value::Array(items.iter().map(graph_value_to_plain_json).collect())
+        }
+        GraphValue::Map(m) => {
+            let obj: serde_json::Map<std::string::String, serde_json::Value> = m
+                .iter()
+                .map(|(k, v)| (k.clone(), graph_value_to_plain_json(v)))
+                .collect();
+            serde_json::Value::Object(obj)
+        }
+        GraphValue::Tagged(TaggedValue::Node {
+            id,
+            label,
+            properties,
+        }) => {
+            let props: serde_json::Map<std::string::String, serde_json::Value> = properties
+                .iter()
+                .map(|(k, v)| (k.clone(), graph_value_to_plain_json(v)))
+                .collect();
+            serde_json::json!({
+                "_element_id": format!("{}:{}", id.table, id.offset),
+                "_labels": [label],
+                "_properties": props
+            })
+        }
+        GraphValue::Tagged(TaggedValue::Rel {
+            id,
+            label,
+            src,
+            dst,
+            properties,
+        }) => {
+            let props: serde_json::Map<std::string::String, serde_json::Value> = properties
+                .iter()
+                .map(|(k, v)| (k.clone(), graph_value_to_plain_json(v)))
+                .collect();
+            serde_json::json!({
+                "_element_id": format!("{}:{}", id.table, id.offset),
+                "_start_node_element_id": format!("{}:{}", src.table, src.offset),
+                "_end_node_element_id": format!("{}:{}", dst.table, dst.offset),
+                "_type": label,
+                "_properties": props
+            })
+        }
+        GraphValue::Tagged(TaggedValue::Path { nodes, rels }) => {
+            let mut elements = Vec::new();
+            for (i, node) in nodes.iter().enumerate() {
+                elements.push(graph_value_to_plain_json(node));
+                if let Some(rel) = rels.get(i) {
+                    elements.push(graph_value_to_plain_json(rel));
+                }
+            }
+            serde_json::json!(elements)
+        }
+        GraphValue::Tagged(TaggedValue::Union { value, .. }) => graph_value_to_plain_json(value),
+    }
+}
+
 /// Every value gets a `{"$type": "TypeName", "_value": ...}` wrapper.
 /// See: <https://neo4j.com/docs/query-api/current/typed-json/>
 pub fn graph_value_to_typed_json(gv: &GraphValue) -> serde_json::Value {
