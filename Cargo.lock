@@ -650,12 +650,36 @@ name = "bolt-proto"
 version = "0.12.0"
 source = "git+https://github.com/russellromney/bolt-rs.git?branch=bolt-5x-support#ccfc0624ef9c0532664ed9b0135d0036f2c5ac0b"
 dependencies = [
- "bolt-proto-derive",
+ "bolt-proto-derive 0.6.0 (git+https://github.com/russellromney/bolt-rs.git?branch=bolt-5x-support)",
  "bytes",
  "chrono",
  "chrono-tz",
  "futures-util",
  "thiserror",
+]
+
+[[package]]
+name = "bolt-proto-5x"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dce9582b429c57c920607a3f95b5f201b511e5112352bf9c981e30cc1b69e2b2"
+dependencies = [
+ "bolt-proto-derive 0.6.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "bytes",
+ "chrono",
+ "chrono-tz",
+ "futures-util",
+ "thiserror",
+]
+
+[[package]]
+name = "bolt-proto-derive"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "768f75ffac4bd96ab314d9199b916228a2e1bb3effd970e94c45f1ba6873d4b0"
+dependencies = [
+ "quote",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -1404,10 +1428,10 @@ dependencies = [
 
 [[package]]
 name = "graphd-engine"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
- "bolt-proto",
+ "bolt-proto-5x",
  "bytes",
  "chrono",
  "lbug",

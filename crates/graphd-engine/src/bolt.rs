@@ -1,7 +1,7 @@
 //! Shared Bolt protocol types and helpers.
 //!
 //! Contains reusable Bolt protocol logic shared between graphd (strana) and
-//! cinch-cloud: version negotiation, value conversion (GraphValue <-> bolt-proto
+//! Shared Bolt protocol helpers: version negotiation, value conversion (GraphValue <-> bolt-proto-5x
 //! Value <-> JSON), and message serialization helpers.
 //!
 //! Consumers provide their own TCP listener, auth, and session worker.
@@ -10,8 +10,8 @@ use bytes::Bytes;
 use std::collections::HashMap;
 use tracing::error;
 
-use bolt_proto::message::{Failure, Record, Success};
-use bolt_proto::{Message, Value};
+use bolt_proto_5x::message::{Failure, Record, Success};
+use bolt_proto_5x::{Message, Value};
 
 use crate::values::GraphValue;
 
