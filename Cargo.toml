@@ -67,5 +67,3 @@ harness = false
 name = "throughput_bench"
 harness = false
 
-[patch.crates-io]
-lbug = { path = "../ladybug-fork/tools/rust_api" }
