@@ -1,10 +1,14 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::error::GraphdError;
 
 /// LadybugDB graph database backend.
+///
+/// The database is stored as `Arc<lbug::Database>` so it can be shared with
+/// HA coordinators (hakuzu) that need direct database access for replication.
 pub struct Backend {
-    db: lbug::Database,
+    db: Arc<lbug::Database>,
 }
 
 impl Backend {
@@ -27,7 +31,22 @@ impl Backend {
     pub fn open_with_config(path: &Path, config: lbug::SystemConfig) -> Result<Self, GraphdError> {
         let db = lbug::Database::new(path, config)
             .map_err(|e| GraphdError::DatabaseError(format!("Failed to open database: {e}")))?;
-        Ok(Self { db })
+        Ok(Self { db: Arc::new(db) })
+    }
+
+    /// Wrap a pre-existing shared database handle.
+    ///
+    /// Use this when the database is created externally and shared with an HA
+    /// coordinator (e.g. hakuzu) that also needs `Arc<lbug::Database>`.
+    pub fn from_database(db: Arc<lbug::Database>) -> Self {
+        Self { db }
+    }
+
+    /// Get a shared reference to the underlying database.
+    ///
+    /// Use this to pass the same database to hakuzu's builder via `.database(db)`.
+    pub fn database(&self) -> &Arc<lbug::Database> {
+        &self.db
     }
 
     /// Create a new connection to the database.

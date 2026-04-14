@@ -25,7 +25,7 @@ pub struct Engine {
     journal: Option<JournalSender>,
     sandbox: Option<Arc<SandboxConfig>>,
     read_semaphore: tokio::sync::Semaphore,
-    write_mutex: tokio::sync::Mutex<()>,
+    write_mutex: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Engine {
@@ -46,7 +46,7 @@ impl Engine {
             journal,
             sandbox: sandbox.map(Arc::new),
             read_semaphore: tokio::sync::Semaphore::new(num_readers),
-            write_mutex: tokio::sync::Mutex::new(()),
+            write_mutex: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -134,6 +134,14 @@ impl Engine {
     /// Snapshot lock — take a read lock for queries, write lock for CHECKPOINT.
     pub fn snapshot_lock(&self) -> &Arc<RwLock<()>> {
         &self.snapshot_lock
+    }
+
+    /// Write mutex — serializes write transactions.
+    ///
+    /// Exposed as `Arc` so HA coordinators (hakuzu) can share the same lock,
+    /// ensuring hakuzu replication and Engine writes are properly serialized.
+    pub fn write_mutex(&self) -> &Arc<tokio::sync::Mutex<()>> {
+        &self.write_mutex
     }
 
     /// Journal sender (None if journaling is disabled).
